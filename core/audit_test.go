@@ -44,7 +44,7 @@ func newClosedEventsSession() *closedEventsSession {
 	return &closedEventsSession{ch: ch}
 }
 
-func (s *closedEventsSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *closedEventsSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	return nil
 }
 func (s *closedEventsSession) RespondPermission(_ string, _ PermissionResult) error { return nil }

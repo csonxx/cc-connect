@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -64,8 +65,8 @@ type cujAgent struct {
 	// Used by tests that need to drive a multi-event turn (text chunks +
 	// permission request + result) from a single Send call. See
 	// setNextSessionEvents on cujAgent.
-	nextSessionEvents    []Event
-	nextSessionDelayMs   int
+	nextSessionEvents  []Event
+	nextSessionDelayMs int
 }
 
 func (a *cujAgent) Name() string { return "cuj" }
@@ -125,8 +126,10 @@ type cujAgentSession struct {
 	pendingDelayMs int
 
 	// observed
-	sentPrompts []string
-	closeCount  int
+	sentPrompts     []string
+	sentImageCounts []int
+	sentFileCounts  []int
+	closeCount      int
 }
 
 // atomic_bool is intentionally lowercase to avoid clash with stdlib atomic.Bool
@@ -146,9 +149,11 @@ func newCUJAgentSession() *cujAgentSession {
 	}
 }
 
-func (s *cujAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *cujAgentSession) Send(prompt string, _ string, images []ImageAttachment, files []FileAttachment) error {
 	s.mu.Lock()
 	s.sentPrompts = append(s.sentPrompts, prompt)
+	s.sentImageCounts = append(s.sentImageCounts, len(images))
+	s.sentFileCounts = append(s.sentFileCounts, len(files))
 	reply := s.reply
 	delay := s.delayMs
 	override := s.nextEventOverride
@@ -208,6 +213,14 @@ func (s *cujAgentSession) getSentPrompts() []string {
 	out := make([]string, len(s.sentPrompts))
 	copy(out, s.sentPrompts)
 	return out
+}
+
+func (s *cujAgentSession) getSentAttachmentCounts() ([]int, []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	imageCounts := append([]int(nil), s.sentImageCounts...)
+	fileCounts := append([]int(nil), s.sentFileCounts...)
+	return imageCounts, fileCounts
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,8 +1143,8 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
 		UserID: "img", UserName: "img",
-		Content: "what is in this image",
-		Images:  []ImageAttachment{{MimeType: "image/png", Data: []byte("\x89PNG fake"), FileName: "chart.png"}},
+		Content:  "what is in this image",
+		Images:   []ImageAttachment{{MimeType: "image/png", Data: []byte("\x89PNG fake"), FileName: "chart.png"}},
 		ReplyCtx: "ctx",
 	}
 	e.ReceiveMessage(plat, msg)
@@ -1139,10 +1152,17 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		agent.mu.Lock()
-		n := len(agent.sessions)
+		var session *cujAgentSession
+		if len(agent.sessions) > 0 {
+			session = agent.sessions[0]
+		}
 		agent.mu.Unlock()
-		if n > 0 {
-			break
+		if session != nil && len(plat.getSent()) > 0 {
+			imageCounts, _ := session.getSentAttachmentCounts()
+			if len(imageCounts) != 1 || imageCounts[0] != 1 {
+				t.Fatalf("agent image counts = %v, want [1]", imageCounts)
+			}
+			return
 		}
 		select {
 		case <-deadline:
@@ -1194,8 +1214,8 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
 		UserID: "file", UserName: "file",
-		Content: "read this file",
-		Files:   []FileAttachment{{MimeType: "text/plain", Data: []byte("hello world"), FileName: "note.txt"}},
+		Content:  "read this file",
+		Files:    []FileAttachment{{MimeType: "text/plain", Data: []byte("hello world"), FileName: "note.txt"}},
 		ReplyCtx: "ctx",
 	}
 	e.ReceiveMessage(plat, msg)
@@ -1203,9 +1223,16 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		agent.mu.Lock()
-		n := len(agent.sessions)
+		var session *cujAgentSession
+		if len(agent.sessions) > 0 {
+			session = agent.sessions[0]
+		}
 		agent.mu.Unlock()
-		if n > 0 {
+		if session != nil && len(plat.getSent()) > 0 {
+			_, fileCounts := session.getSentAttachmentCounts()
+			if len(fileCounts) != 1 || fileCounts[0] != 1 {
+				t.Fatalf("agent file counts = %v, want [1]", fileCounts)
+			}
 			return
 		}
 		select {
@@ -2323,5 +2350,90 @@ func TestCUJ_STREAM1_StreamingResumesAfterPermissionPrompt(t *testing.T) {
 		if strings.Contains(m, postText) {
 			t.Fatalf("post-resolution text was bulk-sent via plain Send (regression: streaming broken after permission prompt). getSent=%#v", plat.getSent())
 		}
+	}
+}
+func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {
+	baseDir := t.TempDir()
+	defaultWorkspace := normalizeWorkspacePath(filepath.Join(baseDir, "workspace-default"))
+	workspaceA := normalizeWorkspacePath(filepath.Join(baseDir, "workspace-a"))
+	workspaceB := normalizeWorkspacePath(filepath.Join(baseDir, "workspace-b"))
+	for _, dir := range []string{defaultWorkspace, workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defaultWorkspace = normalizeWorkspacePath(defaultWorkspace)
+	workspaceA = normalizeWorkspacePath(workspaceA)
+	workspaceB = normalizeWorkspacePath(workspaceB)
+
+	const agentName = "cuj-feishu-topic-workspace-agent"
+	RegisterAgent(agentName, func(map[string]any) (Agent, error) {
+		return &namedTestAgent{name: agentName}, nil
+	})
+	platform := &stubPlatformEngine{n: "feishu"}
+	engine := NewEngine(
+		"test",
+		&namedTestAgent{name: agentName},
+		[]Platform{platform},
+		filepath.Join(t.TempDir(), "sessions.json"),
+		LangEnglish,
+	)
+	engine.SetMultiWorkspace(baseDir, filepath.Join(t.TempDir(), "bindings.json"))
+	engine.workspaceBindings.Bind(
+		"project:test",
+		workspaceChannelKey("feishu", "oc_chat"),
+		"topic-group",
+		defaultWorkspace,
+	)
+
+	sendTopicCommand := func(rootID, command string) {
+		engine.ReceiveMessage(platform, &Message{
+			SessionKey:       "feishu:oc_chat:root:" + rootID,
+			Platform:         "feishu",
+			MessageID:        "msg-" + rootID,
+			UserID:           "user",
+			UserName:         "user",
+			Content:          command,
+			ChannelKey:       "oc_chat:topic:" + rootID,
+			LegacyChannelKey: "oc_chat",
+			ReplyCtx:         "ctx-" + rootID,
+		})
+	}
+	lastReply := func() string {
+		sent := platform.getSent()
+		if len(sent) == 0 {
+			t.Fatal("expected a user-visible workspace reply")
+		}
+		return sent[len(sent)-1]
+	}
+
+	// User actions 1-3: A gets an override, while B first inherits the chat
+	// default and can then set its own override.
+	sendTopicCommand("om_root_a", "/workspace bind workspace-a")
+	sendTopicCommand("om_root_b", "/workspace")
+	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(defaultWorkspace)) {
+		t.Fatalf("topic B did not inherit the chat default: %q", got)
+	}
+	sendTopicCommand("om_root_b", "/workspace bind workspace-b")
+
+	// User actions 4-5: each topic reports its own workspace.
+	sendTopicCommand("om_root_a", "/workspace")
+	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(workspaceA)) {
+		t.Fatalf("topic A workspace reply = %q, want %q", got, normalizeWorkspacePath(workspaceA))
+	}
+	sendTopicCommand("om_root_b", "/workspace")
+	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(workspaceB)) {
+		t.Fatalf("topic B workspace reply = %q, want %q", got, normalizeWorkspacePath(workspaceB))
+	}
+
+	// User action 6: unbinding A restores the chat default and does not affect B.
+	sendTopicCommand("om_root_a", "/workspace unbind")
+	sendTopicCommand("om_root_a", "/workspace")
+	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(defaultWorkspace)) {
+		t.Fatalf("topic A did not fall back to the chat default after unbind: %q", got)
+	}
+	sendTopicCommand("om_root_b", "/workspace")
+	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(workspaceB)) {
+		t.Fatalf("topic B changed after topic A unbind: %q", got)
 	}
 }

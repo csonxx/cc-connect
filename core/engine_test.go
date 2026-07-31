@@ -29,12 +29,14 @@ func (a *stubAgent) Stop() error                                                
 
 type stubAgentSession struct{}
 
-func (s *stubAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error { return nil }
-func (s *stubAgentSession) RespondPermission(_ string, _ PermissionResult) error         { return nil }
-func (s *stubAgentSession) Events() <-chan Event                                         { return make(chan Event) }
-func (s *stubAgentSession) CurrentSessionID() string                                     { return "stub-session" }
-func (s *stubAgentSession) Alive() bool                                                  { return true }
-func (s *stubAgentSession) Close() error                                                 { return nil }
+func (s *stubAgentSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	return nil
+}
+func (s *stubAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *stubAgentSession) Events() <-chan Event                                 { return make(chan Event) }
+func (s *stubAgentSession) CurrentSessionID() string                             { return "stub-session" }
+func (s *stubAgentSession) Alive() bool                                          { return true }
+func (s *stubAgentSession) Close() error                                         { return nil }
 
 type recordingAgentSession struct {
 	stubAgentSession
@@ -194,7 +196,7 @@ func newResultAgentSession(result string) *resultAgentSession {
 	}
 }
 
-func (s *resultAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *resultAgentSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.sentPrompts = append(s.sentPrompts, prompt)
 	s.sendOnce.Do(func() {
 		s.events <- Event{Type: EventResult, Content: s.result, Done: true}
@@ -2779,6 +2781,58 @@ func TestEngine_AdminFrom_GatesUpgrade(t *testing.T) {
 
 	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "admin") {
 		t.Errorf("non-admin should be blocked from /upgrade, got: %v", p.sent)
+	}
+}
+
+func TestCmdAgentSwitch_PersistsResetsSessionAndRequestsRestart(t *testing.T) {
+	drainRestart := func() {
+		select {
+		case <-RestartCh:
+		default:
+		}
+	}
+	drainRestart()
+	t.Cleanup(drainRestart)
+
+	e := newTestEngine()
+	e.SetAdminFrom("admin")
+	e.SetAlternateAgentTypes([]string{"claudecode"})
+
+	var savedAgentType string
+	e.SetAgentTypeSaveFunc(func(agentType string) error {
+		savedAgentType = agentType
+		return nil
+	})
+
+	const sessionKey = "test:admin"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	session.SetAgentSessionID("old-session", "stub")
+	session.AddHistory("user", "old context")
+
+	p := &stubPlatformEngine{n: "test"}
+	msg := &Message{SessionKey: sessionKey, UserID: "admin", ReplyCtx: "ctx"}
+	e.handleCommand(p, msg, "/agent switch claudecode")
+
+	if savedAgentType != "claudecode" {
+		t.Fatalf("saved agent type = %q, want claudecode", savedAgentType)
+	}
+	if got := session.GetAgentSessionID(); got != "" {
+		t.Fatalf("agent session ID = %q, want cleared", got)
+	}
+	if got := session.HistoryLen(); got != 0 {
+		t.Fatalf("history length = %d, want 0", got)
+	}
+	if sent := p.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "claudecode") {
+		t.Fatalf("switch reply = %v, want claudecode confirmation", sent)
+	}
+
+	select {
+	case req := <-RestartCh:
+		if req.SessionKey != sessionKey || req.Platform != p.Name() {
+			t.Fatalf("restart request = %+v, want session=%q platform=%q", req, sessionKey, p.Name())
+		}
+	default:
+		t.Fatal("expected restart request after agent switch")
 	}
 }
 
@@ -6014,6 +6068,37 @@ func TestHandleMessage_ExtraContentOnlyIsProcessed(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_OnAcceptedOnlyRunsForAgentTurn(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	commandAccepted := false
+	e.handleMessage(p, &Message{
+		SessionKey: "test:command-user",
+		ReplyCtx:   "ctx",
+		Content:    "/status",
+		Platform:   "test",
+		UserID:     "command-user",
+		OnAccepted: func() { commandAccepted = true },
+	})
+	if commandAccepted {
+		t.Fatal("handled command consumed agent-bound context")
+	}
+
+	agentAccepted := false
+	e.handleMessage(p, &Message{
+		SessionKey: "test:agent-user",
+		ReplyCtx:   "ctx",
+		Content:    "hello",
+		Platform:   "test",
+		UserID:     "agent-user",
+		OnAccepted: func() { agentAccepted = true },
+	})
+	if !agentAccepted {
+		t.Fatal("agent-bound message did not run OnAccepted")
+	}
+}
+
 func TestCmdDiff_RejectsDashTarget(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -6194,6 +6279,32 @@ func TestCmdUsage_LocalizedChinese(t *testing.T) {
 	}
 	if strings.Contains(got, "```") {
 		t.Fatalf("usage text = %q, should not use code block on plain platform", got)
+	}
+}
+
+func TestFormatUsageReport_SingleSevenDayWindowDoesNotDuplicate(t *testing.T) {
+	report := &UsageReport{
+		Email: "dev@example.com",
+		Plan:  "team",
+		Buckets: []UsageBucket{{
+			Name:         "Rate limit",
+			Allowed:      true,
+			LimitReached: false,
+			Windows: []UsageWindow{
+				{Name: "Primary", UsedPercent: 40, WindowSeconds: 604800, ResetAfterSeconds: 100000},
+			},
+		}},
+	}
+
+	got := formatUsageReport(report, LangEnglish)
+	if c := strings.Count(got, "7d limit"); c != 1 {
+		t.Fatalf("7d limit rendered %d times, want 1: %q", c, got)
+	}
+	if c := strings.Count(got, "Remaining: 60%"); c != 1 {
+		t.Fatalf("Remaining: 60%% rendered %d times, want 1: %q", c, got)
+	}
+	if strings.Contains(got, "5h limit") {
+		t.Fatalf("usage text = %q, should not invent a 5-hour window", got)
 	}
 }
 
@@ -6709,7 +6820,7 @@ func TestProcessInteractiveEvents_AskUserQuestionFromAgent_RendersRichCardPrompt
 
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- sess.Send("prompt", nil, nil)
+		sendDone <- sess.Send("prompt", "", nil, nil)
 	}()
 
 	done := make(chan struct{})
@@ -6778,7 +6889,7 @@ func TestProcessInteractiveEvents_AskUserQuestionFromAgent_RendersLegacyPrompt(t
 
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- sess.Send("prompt", nil, nil)
+		sendDone <- sess.Send("prompt", "", nil, nil)
 	}()
 
 	done := make(chan struct{})
@@ -7255,7 +7366,7 @@ func newControllableSession(id string) *controllableAgentSession {
 	}
 }
 
-func (s *controllableAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *controllableAgentSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	return nil
 }
 func (s *controllableAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
@@ -8571,7 +8682,7 @@ func newQueuingSession(id string) *queuingAgentSession {
 	}
 }
 
-func (s *queuingAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *queuingAgentSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.sendMu.Lock()
 	s.sendCalls = append(s.sendCalls, prompt)
 	s.sendMu.Unlock()
@@ -8599,7 +8710,7 @@ func newBlockingSendSession(id string) *blockingSendAgentSession {
 	}
 }
 
-func (s *blockingSendAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *blockingSendAgentSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.sendStarted <- struct{}{}
 	<-s.unblock
 	return nil
@@ -8694,7 +8805,7 @@ func TestProcessInteractiveEvents_PermissionWhileSendBlocked(t *testing.T) {
 
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- sess.Send("prompt", nil, nil)
+		sendDone <- sess.Send("prompt", "", nil, nil)
 	}()
 
 	done := make(chan struct{})
@@ -15121,7 +15232,7 @@ func newCodexLikeSession(threadID string) *codexLikeSession {
 	}
 }
 
-func (s *codexLikeSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *codexLikeSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.hasSentID = true
 	s.events <- Event{Type: EventText, Content: "Agent reply to: " + prompt}
 	s.events <- Event{Type: EventResult, SessionID: s.threadID, Content: "Done", Done: true}
@@ -15224,7 +15335,7 @@ func newClaudeCodeLikeSession(threadID string) *claudeCodeLikeSession {
 	}
 }
 
-func (s *claudeCodeLikeSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *claudeCodeLikeSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.hasSentID = true
 	// claudecode sends an early system event with SessionID (empty content)
 	s.events <- Event{Type: EventText, Content: "", SessionID: s.threadID}
@@ -15294,7 +15405,7 @@ func newACPLikeSession(threadID string) *acpLikeSession {
 	}
 }
 
-func (s *acpLikeSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *acpLikeSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.events <- Event{Type: EventText, Content: "Reply", SessionID: s.threadID}
 	s.events <- Event{Type: EventResult, SessionID: s.threadID, Content: "Done", Done: true}
 	return nil

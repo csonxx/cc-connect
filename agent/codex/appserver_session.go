@@ -493,13 +493,13 @@ func (s *appServerSession) storeTokenUsage(notif appServerThreadTokenUsageNotifi
 	s.totalUsage = cloneTokenUsage(totalUsage)
 }
 
-func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
+func (s *appServerSession) Send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
 
 	if len(files) > 0 {
-		filePaths := core.SaveFilesToDisk(s.workDir, files)
+		filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
 		prompt = core.AppendFileRefs(prompt, filePaths)
 	}
 
