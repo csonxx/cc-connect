@@ -1709,6 +1709,20 @@ func (e *Engine) ActiveSessionKeys() []string {
 // It finds the platform that owns the session key, reconstructs a reply context,
 // and processes the message as if the user sent it.
 func (e *Engine) ExecuteCronJob(job *CronJob) error {
+	ctx := e.ctx
+	cancel := func() {}
+	if timeout := job.ExecutionTimeout(); timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	return e.ExecuteCronJobContext(ctx, job)
+}
+
+// ExecuteCronJobContext cancels the actual session, including session startup.
+func (e *Engine) ExecuteCronJobContext(ctx context.Context, job *CronJob) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventCronTriggered,
 		SessionKey: job.SessionKey,
@@ -1807,19 +1821,20 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	if job.IsShellJob() {
-		return e.executeCronShell(effectivePlatform, replyCtx, job)
+		return e.executeCronShell(effectivePlatform, replyCtx, job, ctx)
 	}
 
 	content := job.Prompt
 
 	msg := &Message{
-		SessionKey:   sessionKey,
-		Platform:     platformName,
-		UserID:       "cron",
-		UserName:     "cron",
-		Content:      content,
-		ReplyCtx:     replyCtx,
-		ModeOverride: job.Mode,
+		executionContext: ctx,
+		SessionKey:       sessionKey,
+		Platform:         platformName,
+		UserID:           "cron",
+		UserName:         "cron",
+		Content:          content,
+		ReplyCtx:         replyCtx,
+		ModeOverride:     job.Mode,
 	}
 
 	// Resolve workspace-specific agent and sessions for multi-workspace mode.
@@ -1887,6 +1902,9 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		prevHistLen := session.HistoryLen()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Empty-response detection via session history delta: processInteractiveMessageWith
 		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
 		// (prevHistLen+2). This approach correctly detects empty responses across all
@@ -1910,6 +1928,9 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 	prevHistLen := session.HistoryLen()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Same empty-response detection as the useNewSession path above.
 	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
@@ -2300,7 +2321,11 @@ func cronRunTitle(job *CronJob) string {
 }
 
 // executeCronShell runs a shell command for a cron job and sends the output.
-func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error {
+func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob, contexts ...context.Context) error {
+	executionContext := e.ctx
+	if len(contexts) > 0 {
+		executionContext = contexts[0]
+	}
 	workDir := job.WorkDir
 	if workDir == "" {
 		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
@@ -2318,7 +2343,7 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 
 	cmdLabel := truncateStr(job.Exec, 60)
 
-	ctx, cancel := context.WithTimeout(e.ctx, timeout)
+	ctx, cancel := context.WithTimeout(executionContext, timeout)
 	defer cancel()
 
 	shellCmd := shellExecCommand(ctx, e.shell, e.shellFlag, e.shellProfile, job.Exec)
@@ -4195,6 +4220,10 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // lockGen is the generation returned by the TryLock that acquired this turn's
 // busy lock; it must be passed to every session.Unlock of this turn (custom 2026-09-12).
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) {
+	executionContext := e.ctx
+	if msg.executionContext != nil {
+		executionContext = msg.executionContext
+	}
 	// session.Unlock() is NOT deferred here — it is called explicitly in
 	// the drain loop below while holding state.mu to close the race window
 	// between "queue is empty" and "session unlocked". A deferred fallback
@@ -4206,7 +4235,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		}
 	}()
 
-	if e.ctx.Err() != nil {
+	if executionContext.Err() != nil {
 		return
 	}
 
@@ -4224,7 +4253,18 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, executionContext)
+	if msg.executionContext != nil {
+		finished := make(chan struct{})
+		defer close(finished)
+		go func() {
+			select {
+			case <-executionContext.Done():
+				e.cleanupInteractiveState(interactiveKey, state)
+			case <-finished:
+			}
+		}()
+	}
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4503,7 +4543,11 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, contexts ...context.Context) *interactiveState {
+	executionContext := e.ctx
+	if len(contexts) > 0 {
+		executionContext = contexts[0]
+	}
 	// /stop removes the state from the map immediately but tears the process
 	// down in the background. Wait that teardown out *before* taking the lock:
 	// spawning now would start a second process on the same agent session ID
@@ -4591,7 +4635,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	// Check if context is already canceled (e.g. during shutdown/restart)
-	if e.ctx.Err() != nil {
+	if executionContext.Err() != nil {
 		slog.Debug("skipping session start: context canceled", "session_key", sessionKey)
 		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
 		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
@@ -4619,7 +4663,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// can detect the mismatch and we should clear the ID rather than
 	// resume a conversation that has nothing to do with this project.
 	if startSessionID != "" {
-		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(e.ctx, startSessionID) {
+		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(executionContext, startSessionID) {
 			slog.Warn("session ID does not belong to this project, clearing it",
 				"session_key", sessionKey, "invalid_session_id", startSessionID)
 			session.SetAgentSessionID("", agent.Name())
@@ -4642,7 +4686,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	agentSession, err := agent.StartSession(executionContext, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
@@ -4655,7 +4699,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			agentSession, err = agent.StartSession(executionContext, "")
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",

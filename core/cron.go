@@ -436,6 +436,7 @@ type cronEntry struct {
 
 // CronScheduler runs cron jobs by injecting synthetic messages into engines.
 type CronScheduler struct {
+	runningJobs        sync.Map // a manual wake must not overlap the same scheduled job
 	store              *CronStore
 	engines            map[string]*Engine // project name → engine
 	entries            map[string]*cronEntry
@@ -844,6 +845,12 @@ func (cs *CronScheduler) runJob(job *CronJob, manual bool) {
 	if !manual && !job.Enabled {
 		return
 	}
+	key := job.Project + ":" + job.ID
+	if _, running := cs.runningJobs.LoadOrStore(key, true); running {
+		slog.Warn("cron: execution already in progress", "id", job.ID, "project", job.Project)
+		return
+	}
+	defer cs.runningJobs.Delete(key)
 
 	cs.mu.RLock()
 	engine, ok := cs.engines[job.Project]
@@ -857,22 +864,13 @@ func (cs *CronScheduler) runJob(job *CronJob, manual bool) {
 
 	slog.Info("cron: executing job", "id", job.ID, "project", job.Project, "manual", manual, "prompt", truncateStr(job.Prompt, 60))
 
-	done := make(chan error, 1)
-	go func() {
-		done <- engine.ExecuteCronJob(job)
-	}()
-
-	var err error
-	timeout := job.ExecutionTimeout()
-	if timeout > 0 {
-		select {
-		case err = <-done:
-		case <-time.After(timeout):
-			err = fmt.Errorf("job timed out after %v", timeout)
-		}
-	} else {
-		err = <-done
+	ctx := engine.ctx
+	cancel := func() {}
+	if timeout := job.ExecutionTimeout(); timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 	}
+	defer cancel()
+	err := engine.ExecuteCronJobContext(ctx, job)
 
 	cs.store.MarkRun(job.ID, err)
 
